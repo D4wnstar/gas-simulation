@@ -1,12 +1,12 @@
-use std::f32::consts::PI;
-
 use bevy::{
+    diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     input::mouse::{MouseMotion, MouseWheel},
     math::{
         bounding::{Bounded2d, IntersectsVolume},
         NormedVectorSpace,
     },
-    prelude::*, // window::PrimaryWindow,
+    prelude::*,
+    sprite::Anchor, // window::PrimaryWindow,
 };
 use rand;
 
@@ -19,8 +19,9 @@ fn main() {
             }),
             ..default()
         }))
+        .add_plugins(FrameTimeDiagnosticsPlugin)
         .init_state::<PauseState>()
-        .add_systems(Startup, setup)
+        .add_systems(Startup, (setup, setup_fps_counter))
         .add_systems(
             FixedUpdate,
             (
@@ -37,7 +38,8 @@ fn main() {
                 check_keyboard_input,
                 drag_camera,
                 update_histogram.run_if(in_state(PauseState::Running)),
-                draw_distribution_overlay.run_if(in_state(PauseState::Running)),
+                draw_distribution_overlay,
+                update_fps,
             ),
         )
         .run();
@@ -82,11 +84,21 @@ struct HistogramBins(Vec<f32>);
 #[derive(Resource)]
 struct MBDistribution(CubicCurve<f32>);
 
+#[derive(Component)]
+struct FpsText;
+
 /* CONSTANTS */
 // Particles
-const PARTICLE_RADIUS: f32 = 10.0;
-const PARTICLE_MASS: f32 = 1.0;
-const NUMBER_OF_PARTICLES: u32 = 100;
+const PARTICLE_RADIUS: f32 = 5.0;
+const PARTICLE_MASS: f32 = 1.;
+const STARTING_SPEED: f32 = 200.0;
+const NUMBER_OF_PARTICLES: u32 = 200;
+
+// Parameters for the spawn grid
+const SPAWN_TOP_LEFT: Vec2 = Vec2::new(-300., 250.);
+const SPAWN_BOTTOM_RIGHT: Vec2 = Vec2::new(300., -100.);
+const SPAWN_X_GAP: f32 = PARTICLE_RADIUS * 4.;
+const SPAWN_Y_GAP: f32 = PARTICLE_RADIUS * 4.;
 
 // Walls
 const BOX_WIDTH: f32 = 1000.;
@@ -105,30 +117,43 @@ const BOX_BOTTOM_RIGHT: Vec3 = Vec3::new(
     -VERT_OFFSET - WALL_THICKNESS / 2.,
     0.,
 );
+const BOX_TOP_RIGHT: Vec3 = Vec3::new(
+    HORI_OFFSET + WALL_THICKNESS / 2.,
+    VERT_OFFSET + WALL_THICKNESS / 2.,
+    0.,
+);
 
 // Histogram
 const BINS: u32 = 10;
-const MAX_SPEED: f32 = 600.;
+const MAX_SPEED: f32 = STARTING_SPEED * 3.;
+const BIN_WIDTH: f32 = MAX_SPEED / BINS as f32;
 
-const BAR_WIDTH: f32 = 20.;
+const BAR_WIDTH: f32 = 20.; // This is in world units, for the mesh geometry. Not to be confused with BIN_WIDTH.
 const BAR_GAP: f32 = 10.;
 const HEIGHT_PER_ELEM: f32 = 10.;
 const LABEL_OFFSET: f32 = -30.;
 
+const GAP_FROM_BOX: f32 = 20.;
 const FIRST_BAR_INIITAL_CENTER: Vec3 = Vec3::new(
-    BOX_BOTTOM_RIGHT.x + BAR_WIDTH,
+    BOX_BOTTOM_RIGHT.x + GAP_FROM_BOX + BAR_WIDTH / 2.,
     BOX_BOTTOM_RIGHT.y - LABEL_OFFSET + 10.,
     0.,
 );
 const LAST_BAR_INIITAL_CENTER: Vec3 = Vec3::new(
-    FIRST_BAR_INIITAL_CENTER.x + BINS as f32 * (BAR_WIDTH + BAR_GAP),
+    FIRST_BAR_INIITAL_CENTER.x + (BINS as f32 - 1.) * (BAR_WIDTH + BAR_GAP),
     FIRST_BAR_INIITAL_CENTER.y,
     0.,
 );
-const HIST_WIDTH: f32 = LAST_BAR_INIITAL_CENTER.x - FIRST_BAR_INIITAL_CENTER.x;
+const HIST_WIDTH: f32 = LAST_BAR_INIITAL_CENTER.x - FIRST_BAR_INIITAL_CENTER.x + BAR_WIDTH;
 
 // Physics
 const BOLTZMANN_CONSTANT: f32 = 1.;
+
+// Physically accurate values (need to implement a raycast check to avoid phasing through walls)
+// const PARTICLE_MASS: f32 = 1.008 * ATOMIC_MASS_UNIT; // kg (mass of hydrogen-1)
+// const STARTING_SPEED: f32 = 2599.0; // m/s (average speed of hydrogen at T = 273 K)
+// const BOLTZMANN_CONSTANT: f32 = 1.38e-23;
+// const ATOMIC_MASS_UNIT: f32 = 1.660e-27; // kg
 
 /* SYSTEMS */
 fn setup(
@@ -141,22 +166,17 @@ fn setup(
 
     commands.spawn(Camera2d::default());
 
-    // Parameters for the spawn grid
-    let top_left = Vec2::new(-300., 100.);
-    let bottom_right = Vec2::new(300., -100.);
-    let mut spawn_point = top_left;
-    let x_gap = PARTICLE_RADIUS * 4.;
-    let y_gap = PARTICLE_RADIUS * 4.;
-
     let mesh_id = meshes.add(Circle::new(PARTICLE_RADIUS));
     let material_id = materials.add(ColorMaterial::from_color(Color::WHITE));
-    let mut rng = rand::thread_rng();
 
     // We need the square of the speeds to get the kinetic energy for temperature later
     let mut speeds_sq: Vec<f32> = Vec::new();
+
+    let mut rng = rand::thread_rng();
+    let mut spawn_point = SPAWN_TOP_LEFT;
     for _ in 0..NUMBER_OF_PARTICLES {
         let translation = Vec3::new(spawn_point.x, spawn_point.y, 0.);
-        let velocity = Dir2::from_rng(&mut rng) * 200.;
+        let velocity = Dir2::from_rng(&mut rng) * STARTING_SPEED;
         speeds_sq.push(velocity.norm_squared());
 
         commands.spawn((
@@ -170,11 +190,11 @@ fn setup(
             MeshMaterial2d(material_id.clone()),
         ));
 
-        if spawn_point.x + x_gap < bottom_right.x {
-            spawn_point.x += x_gap;
+        if spawn_point.x + SPAWN_X_GAP < SPAWN_BOTTOM_RIGHT.x {
+            spawn_point.x += SPAWN_X_GAP;
         } else {
-            spawn_point.y -= y_gap;
-            spawn_point.x = top_left.x;
+            spawn_point.y -= SPAWN_Y_GAP;
+            spawn_point.x = SPAWN_TOP_LEFT.x;
         }
     }
 
@@ -233,12 +253,14 @@ fn setup(
     let bar_mesh = meshes.add(Rectangle::new(BAR_WIDTH, HEIGHT_PER_ELEM));
     let bar_color = materials.add(ColorMaterial::from_color(Srgba::rgb(0., 100., 100.)));
 
-    let thresholds: Vec<f32> = (0..=BINS)
-        .map(|i| i as f32 * MAX_SPEED / BINS as f32)
-        .collect();
+    let thresholds: Vec<f32> = (0..=BINS).map(|i| i as f32 * BIN_WIDTH as f32).collect();
     commands.insert_resource(HistogramBins(thresholds));
 
-    // commands.spawn((Text2d::new("Hi!!!!"), Transform::from_xyz(550., 100., 0.)));
+    commands.spawn((
+        Text2d::new("2D Maxwell-Boltzmann\nspeed distribution"),
+        Transform::from_translation(BOX_TOP_RIGHT + Vec3::new(GAP_FROM_BOX, 0., 0.)),
+        Anchor::TopLeft,
+    ));
 
     for i in 0..BINS {
         commands.spawn((
@@ -248,13 +270,19 @@ fn setup(
             MeshMaterial2d(bar_color.clone()),
         ));
 
-        commands.spawn((
-            Text2d::new(format!("{i}")),
-            Transform::from_xyz(spawn_point.x, spawn_point.y + LABEL_OFFSET, spawn_point.z),
-        ));
+        if i % 2 == 0 {
+            commands.spawn((
+                Text2d::new(format!("{}", i as f32 * BIN_WIDTH)),
+                Transform::from_xyz(spawn_point.x, spawn_point.y + LABEL_OFFSET, spawn_point.z),
+            ));
+        }
 
         spawn_point.x += BAR_WIDTH + BAR_GAP;
     }
+    commands.spawn((
+        Text2d::new(format!("{}", BINS as f32 * BIN_WIDTH)),
+        Transform::from_xyz(spawn_point.x, spawn_point.y + LABEL_OFFSET, spawn_point.z),
+    ));
 
     // Maxwell-Boltzmann distribution overlay
     // Temperature comes from the equipartition theorem for a 2D monoatomic ideal gas. We know the
@@ -262,12 +290,13 @@ fn setup(
     let avg_kinetic_energy =
         PARTICLE_MASS / (2. * NUMBER_OF_PARTICLES as f32) * speeds_sq.iter().sum::<f32>();
     let temp = avg_kinetic_energy / BOLTZMANN_CONSTANT;
+    info!("Temperature: {temp}");
+
     let sampling_points: Vec<f32> = (0..20).map(|i| i as f32 * MAX_SPEED / 20.).collect();
     let pdf_points: Vec<f32> = sampling_points
         .iter()
         .map(|v| maxwell_boltzmann_2d_pdf(*v, PARTICLE_MASS, temp))
         .collect();
-    info_once!("{pdf_points:#?}");
     let pdf_curve = CubicCardinalSpline::new(0.5, pdf_points)
         .to_curve()
         .unwrap();
@@ -424,15 +453,41 @@ fn draw_distribution_overlay(mb_distr: Res<MBDistribution>, mut gizmos: Gizmos) 
         .iter_positions(resolution)
         .enumerate()
         .map(|(i, p)| {
-            // info!("{p}");
+            // Probability needs to be weight by total number and bin width to bring it in histogram units
+            let predicted_elems = p * NUMBER_OF_PARTICLES as f32 * BIN_WIDTH;
             Vec2::new(
                 starting_point.x + HIST_WIDTH / resolution as f32 * i as f32,
-                starting_point.y + p * NUMBER_OF_PARTICLES as f32 * HEIGHT_PER_ELEM,
+                starting_point.y + predicted_elems * HEIGHT_PER_ELEM,
             )
         })
         .collect();
 
     gizmos.linestrip_2d(points, Srgba::rgb(100., 0., 100.));
+}
+
+fn setup_fps_counter(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                height: Val::Px(30.),
+                width: Val::Px(40.),
+                ..Default::default()
+            },
+            BackgroundColor(Color::BLACK),
+        ))
+        .with_child((Text("FPS".into()), FpsText));
+}
+
+fn update_fps(diagnostics: Res<DiagnosticsStore>, mut query: Query<&mut Text, With<FpsText>>) {
+    let maybe_text = query.get_single_mut();
+    if let Some(fps) = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FPS)
+        .and_then(|fps| fps.smoothed())
+    {
+        if let Ok(mut text) = maybe_text {
+            text.0 = format!("{fps:.0}");
+        }
+    }
 }
 
 /* UTILITY FUNCTIONS */
