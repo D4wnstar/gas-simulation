@@ -1,3 +1,5 @@
+use std::f32::consts::PI;
+
 use bevy::{
     input::mouse::{MouseMotion, MouseWheel},
     math::{
@@ -25,7 +27,6 @@ fn main() {
                 move_particles,
                 check_particle_collisions,
                 check_wall_collisions,
-                // unstuck_particles,
             )
                 .chain()
                 .run_if(in_state(PauseState::Running)),
@@ -36,6 +37,7 @@ fn main() {
                 check_keyboard_input,
                 drag_camera,
                 update_histogram.run_if(in_state(PauseState::Running)),
+                draw_distribution_overlay.run_if(in_state(PauseState::Running)),
             ),
         )
         .run();
@@ -72,14 +74,61 @@ struct Wall {
 #[derive(Component)]
 struct HistogramBar {
     elems: u32,
-    height_per_elem: f32,
 }
 
 #[derive(Resource)]
 struct HistogramBins(Vec<f32>);
 
+#[derive(Resource)]
+struct MBDistribution(CubicCurve<f32>);
+
+/* CONSTANTS */
+// Particles
+const PARTICLE_RADIUS: f32 = 10.0;
+const PARTICLE_MASS: f32 = 1.0;
+const NUMBER_OF_PARTICLES: u32 = 100;
+
+// Walls
+const BOX_WIDTH: f32 = 1000.;
+const BOX_HEIGHT: f32 = 700.;
+const WALL_THICKNESS: f32 = 20.;
+
+const HORI_OFFSET: f32 = BOX_WIDTH / 2.;
+const VERT_OFFSET: f32 = (BOX_HEIGHT - WALL_THICKNESS) / 2.;
+const LEFT_WALL_CENTER: Vec3 = Vec3::new(-HORI_OFFSET, 0., 0.);
+const RIGHT_WALL_CENTER: Vec3 = Vec3::new(HORI_OFFSET, 0., 0.);
+const TOP_WALL_CENTER: Vec3 = Vec3::new(0., VERT_OFFSET, 0.);
+const BOTTOM_WALL_CENTER: Vec3 = Vec3::new(0., -VERT_OFFSET, 0.);
+
+const BOX_BOTTOM_RIGHT: Vec3 = Vec3::new(
+    HORI_OFFSET + WALL_THICKNESS / 2.,
+    -VERT_OFFSET - WALL_THICKNESS / 2.,
+    0.,
+);
+
+// Histogram
 const BINS: u32 = 10;
 const MAX_SPEED: f32 = 600.;
+
+const BAR_WIDTH: f32 = 20.;
+const BAR_GAP: f32 = 10.;
+const HEIGHT_PER_ELEM: f32 = 10.;
+const LABEL_OFFSET: f32 = -30.;
+
+const FIRST_BAR_INIITAL_CENTER: Vec3 = Vec3::new(
+    BOX_BOTTOM_RIGHT.x + BAR_WIDTH,
+    BOX_BOTTOM_RIGHT.y - LABEL_OFFSET + 10.,
+    0.,
+);
+const LAST_BAR_INIITAL_CENTER: Vec3 = Vec3::new(
+    FIRST_BAR_INIITAL_CENTER.x + BINS as f32 * (BAR_WIDTH + BAR_GAP),
+    FIRST_BAR_INIITAL_CENTER.y,
+    0.,
+);
+const HIST_WIDTH: f32 = LAST_BAR_INIITAL_CENTER.x - FIRST_BAR_INIITAL_CENTER.x;
+
+// Physics
+const BOLTZMANN_CONSTANT: f32 = 1.;
 
 /* SYSTEMS */
 fn setup(
@@ -92,28 +141,28 @@ fn setup(
 
     commands.spawn(Camera2d::default());
 
-    let radius = 10.0;
-
-    let number_of_particles = 100;
-
     // Parameters for the spawn grid
     let top_left = Vec2::new(-300., 100.);
     let bottom_right = Vec2::new(300., -100.);
     let mut spawn_point = top_left;
-    let x_gap = radius * 4.;
-    let y_gap = radius * 4.;
+    let x_gap = PARTICLE_RADIUS * 4.;
+    let y_gap = PARTICLE_RADIUS * 4.;
 
-    let mesh_id = meshes.add(Circle::new(radius));
+    let mesh_id = meshes.add(Circle::new(PARTICLE_RADIUS));
     let material_id = materials.add(ColorMaterial::from_color(Color::WHITE));
     let mut rng = rand::thread_rng();
-    for _ in 0..number_of_particles {
+
+    // We need the square of the speeds to get the kinetic energy for temperature later
+    let mut speeds_sq: Vec<f32> = Vec::new();
+    for _ in 0..NUMBER_OF_PARTICLES {
         let translation = Vec3::new(spawn_point.x, spawn_point.y, 0.);
         let velocity = Dir2::from_rng(&mut rng) * 200.;
+        speeds_sq.push(velocity.norm_squared());
 
         commands.spawn((
             Particle {
-                radius,
-                mass: 1.0,
+                radius: PARTICLE_RADIUS,
+                mass: PARTICLE_MASS,
                 velocity,
             },
             Transform::from_translation(translation),
@@ -130,64 +179,58 @@ fn setup(
     }
 
     // Outer walls
-    let thickness = 20.;
-    let hori_width = 1000. - thickness;
-    let vert_height = 700.;
-
-    let horizontal_mesh = meshes.add(Rectangle::new(hori_width, thickness));
-    let vertical_mesh = meshes.add(Rectangle::new(thickness, vert_height));
+    let horizontal_mesh = meshes.add(Rectangle::new(BOX_WIDTH - WALL_THICKNESS, WALL_THICKNESS));
+    let vertical_mesh = meshes.add(Rectangle::new(WALL_THICKNESS, BOX_HEIGHT));
     let wall_material = materials.add(ColorMaterial::from_color(Color::BLACK));
 
     // Left wall
     commands.spawn((
         Wall {
-            width: thickness,
-            height: vert_height,
+            width: WALL_THICKNESS,
+            height: BOX_HEIGHT,
             orientation: WallOrientation::Vertical,
         },
-        Transform::from_xyz(-500., 0., 0.),
+        Transform::from_translation(LEFT_WALL_CENTER),
         Mesh2d(vertical_mesh.clone()),
         MeshMaterial2d(wall_material.clone()),
     ));
     // Right wall
     commands.spawn((
         Wall {
-            width: thickness,
-            height: vert_height,
+            width: WALL_THICKNESS,
+            height: BOX_HEIGHT,
             orientation: WallOrientation::Vertical,
         },
-        Transform::from_xyz(500., 0., 0.),
+        Transform::from_translation(RIGHT_WALL_CENTER),
         Mesh2d(vertical_mesh),
         MeshMaterial2d(wall_material.clone()),
     ));
     // Top wall
     commands.spawn((
         Wall {
-            width: hori_width,
-            height: thickness,
+            width: BOX_WIDTH,
+            height: WALL_THICKNESS,
             orientation: WallOrientation::Horizontal,
         },
-        Transform::from_xyz(0., 340., 0.),
+        Transform::from_translation(TOP_WALL_CENTER),
         Mesh2d(horizontal_mesh.clone()),
         MeshMaterial2d(wall_material.clone()),
     ));
     // Bottom wall
     commands.spawn((
         Wall {
-            width: hori_width,
-            height: thickness,
+            width: BOX_WIDTH,
+            height: WALL_THICKNESS,
             orientation: WallOrientation::Horizontal,
         },
-        Transform::from_xyz(0., -340., 0.),
+        Transform::from_translation(BOTTOM_WALL_CENTER),
         Mesh2d(horizontal_mesh),
         MeshMaterial2d(wall_material),
     ));
 
     // Histogram
-    let mut spawn_point = Vec3::new(530., -100., 0.);
-    let bar_width = 20.;
-    let height_per_elem = 10.;
-    let bar_mesh = meshes.add(Rectangle::new(20., height_per_elem));
+    let mut spawn_point = FIRST_BAR_INIITAL_CENTER;
+    let bar_mesh = meshes.add(Rectangle::new(BAR_WIDTH, HEIGHT_PER_ELEM));
     let bar_color = materials.add(ColorMaterial::from_color(Srgba::rgb(0., 100., 100.)));
 
     let thresholds: Vec<f32> = (0..=BINS)
@@ -199,10 +242,7 @@ fn setup(
 
     for i in 0..BINS {
         commands.spawn((
-            HistogramBar {
-                elems: 0,
-                height_per_elem,
-            },
+            HistogramBar { elems: 0 },
             Transform::from_translation(spawn_point),
             Mesh2d(bar_mesh.clone()),
             MeshMaterial2d(bar_color.clone()),
@@ -210,11 +250,28 @@ fn setup(
 
         commands.spawn((
             Text2d::new(format!("{i}")),
-            Transform::from_xyz(spawn_point.x, spawn_point.y - 30., spawn_point.z),
+            Transform::from_xyz(spawn_point.x, spawn_point.y + LABEL_OFFSET, spawn_point.z),
         ));
 
-        spawn_point.x += bar_width * 1.5;
+        spawn_point.x += BAR_WIDTH + BAR_GAP;
     }
+
+    // Maxwell-Boltzmann distribution overlay
+    // Temperature comes from the equipartition theorem for a 2D monoatomic ideal gas. We know the
+    // kinetic energies, so we can reverse it to get the temperature of the system.
+    let avg_kinetic_energy =
+        PARTICLE_MASS / (2. * NUMBER_OF_PARTICLES as f32) * speeds_sq.iter().sum::<f32>();
+    let temp = avg_kinetic_energy / BOLTZMANN_CONSTANT;
+    let sampling_points: Vec<f32> = (0..20).map(|i| i as f32 * MAX_SPEED / 20.).collect();
+    let pdf_points: Vec<f32> = sampling_points
+        .iter()
+        .map(|v| maxwell_boltzmann_2d_pdf(*v, PARTICLE_MASS, temp))
+        .collect();
+    info_once!("{pdf_points:#?}");
+    let pdf_curve = CubicCardinalSpline::new(0.5, pdf_points)
+        .to_curve()
+        .unwrap();
+    commands.insert_resource(MBDistribution(pdf_curve));
 }
 
 fn update_histogram(
@@ -244,7 +301,7 @@ fn update_histogram(
         let change = bins[i] as i32 - bar.elems as i32;
         bar.elems = bins[i];
         transform.scale.y = bar.elems as f32;
-        transform.translation.y += (change as f32 * bar.height_per_elem) / 2.;
+        transform.translation.y += (change as f32 * HEIGHT_PER_ELEM) / 2.;
     }
 }
 
@@ -356,6 +413,28 @@ fn drag_camera(
     }
 }
 
+fn draw_distribution_overlay(mb_distr: Res<MBDistribution>, mut gizmos: Gizmos) {
+    let curve = &mb_distr.0;
+    let resolution = 100 * curve.segments().len();
+    let starting_point = Vec2::new(
+        FIRST_BAR_INIITAL_CENTER.x - BAR_WIDTH / 2.,
+        FIRST_BAR_INIITAL_CENTER.y,
+    );
+    let points: Vec<Vec2> = curve
+        .iter_positions(resolution)
+        .enumerate()
+        .map(|(i, p)| {
+            // info!("{p}");
+            Vec2::new(
+                starting_point.x + HIST_WIDTH / resolution as f32 * i as f32,
+                starting_point.y + p * NUMBER_OF_PARTICLES as f32 * HEIGHT_PER_ELEM,
+            )
+        })
+        .collect();
+
+    gizmos.linestrip_2d(points, Srgba::rgb(100., 0., 100.));
+}
+
 /* UTILITY FUNCTIONS */
 fn compute_velocity_delta(x1: Vec2, x2: Vec2, v1: Vec2, v2: Vec2, m1: f32, m2: f32) -> Vec2 {
     let total_m = m1 + m2;
@@ -371,4 +450,11 @@ fn compute_overlap(x1: Vec2, x2: Vec2, radius1: f32, radius2: f32) -> Vec3 {
     let overlap = radius1 + radius2 - distance;
     let overlap_vec = overlap * distance_between_centers / distance;
     return Vec3::new(overlap_vec.x, overlap_vec.y, 0.);
+}
+
+/// The probability density function for a 2D Maxwell-Boltzmann distribution.
+fn maxwell_boltzmann_2d_pdf(speed: f32, mass: f32, temperature: f32) -> f32 {
+    let a_sq = BOLTZMANN_CONSTANT * temperature / mass;
+    let speed_sq = speed.powi(2);
+    return speed / a_sq * (-speed_sq / (2. * a_sq)).exp();
 }
