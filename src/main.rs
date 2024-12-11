@@ -1,3 +1,5 @@
+use std::f32::consts::PI;
+
 use bevy::{
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     input::mouse::{MouseMotion, MouseWheel},
@@ -91,8 +93,16 @@ struct FpsText;
 // Particles
 const PARTICLE_RADIUS: f32 = 5.0;
 const PARTICLE_MASS: f32 = 1.;
-const STARTING_SPEED: f32 = 200.0;
-const NUMBER_OF_PARTICLES: u32 = 200;
+const STARTING_SPEED: f32 = 200.0; // Velocity direction is randomized
+const NUMBER_OF_PARTICLES: u32 = 400;
+// Temperature comes from the equipartition theorem for a 2D monatomic ideal gas. We know the
+// the speeds and therefore the kinetic energies, so we can reverse it to get the temperature of the system.
+const AVG_KINETIC_ENERGY: f32 = PARTICLE_MASS / 2. * STARTING_SPEED * STARTING_SPEED;
+const TEMPERATURE: f32 = AVG_KINETIC_ENERGY / BOLTZMANN_CONSTANT;
+const DE_BROGLIE_THERMAL_WAVELENGHT_SQUARE: f32 =
+    2. * PI * REDUCED_PLANCK_CONSTANT * REDUCED_PLANCK_CONSTANT
+        / (PARTICLE_MASS * BOLTZMANN_CONSTANT * TEMPERATURE); // Can't use sqrt() in constant definitions
+const PARTICLE_DENSITY: f32 = NUMBER_OF_PARTICLES as f32 / BOX_AREA;
 
 // Parameters for the spawn grid
 const SPAWN_TOP_LEFT: Vec2 = Vec2::new(-300., 250.);
@@ -104,6 +114,7 @@ const SPAWN_Y_GAP: f32 = PARTICLE_RADIUS * 4.;
 const BOX_WIDTH: f32 = 1000.;
 const BOX_HEIGHT: f32 = 700.;
 const WALL_THICKNESS: f32 = 20.;
+const BOX_AREA: f32 = (BOX_WIDTH - WALL_THICKNESS) * (BOX_HEIGHT - WALL_THICKNESS);
 
 const HORI_OFFSET: f32 = BOX_WIDTH / 2.;
 const VERT_OFFSET: f32 = (BOX_HEIGHT - WALL_THICKNESS) / 2.;
@@ -129,8 +140,9 @@ const MAX_SPEED: f32 = STARTING_SPEED * 3.;
 const BIN_WIDTH: f32 = MAX_SPEED / BINS as f32;
 
 const BAR_WIDTH: f32 = 20.; // This is in world units, for the mesh geometry. Not to be confused with BIN_WIDTH.
+const HIST_HEIGHT: f32 = 600.;
 const BAR_GAP: f32 = 10.;
-const HEIGHT_PER_ELEM: f32 = 10.;
+const HEIGHT_PER_ELEM: f32 = HIST_HEIGHT / (0.3 * NUMBER_OF_PARTICLES as f32);
 const LABEL_OFFSET: f32 = -30.;
 
 const GAP_FROM_BOX: f32 = 20.;
@@ -148,10 +160,11 @@ const HIST_WIDTH: f32 = LAST_BAR_INIITAL_CENTER.x - FIRST_BAR_INIITAL_CENTER.x +
 
 // Physics
 const BOLTZMANN_CONSTANT: f32 = 1.;
+const REDUCED_PLANCK_CONSTANT: f32 = 1.;
 
 // Physically accurate values (need to implement a raycast check to avoid phasing through walls)
-// const PARTICLE_MASS: f32 = 1.008 * ATOMIC_MASS_UNIT; // kg (mass of hydrogen-1)
-// const STARTING_SPEED: f32 = 2599.0; // m/s (average speed of hydrogen at T = 273 K)
+// const PARTICLE_MASS: f32 = 4.002 * ATOMIC_MASS_UNIT; // kg (mass of helium-4)
+// const STARTING_SPEED: f32 = 1351.3; // m/s (average speed of helium at T = 293 K)
 // const BOLTZMANN_CONSTANT: f32 = 1.38e-23;
 // const ATOMIC_MASS_UNIT: f32 = 1.660e-27; // kg
 
@@ -169,15 +182,11 @@ fn setup(
     let mesh_id = meshes.add(Circle::new(PARTICLE_RADIUS));
     let material_id = materials.add(ColorMaterial::from_color(Color::WHITE));
 
-    // We need the square of the speeds to get the kinetic energy for temperature later
-    let mut speeds_sq: Vec<f32> = Vec::new();
-
     let mut rng = rand::thread_rng();
     let mut spawn_point = SPAWN_TOP_LEFT;
     for _ in 0..NUMBER_OF_PARTICLES {
         let translation = Vec3::new(spawn_point.x, spawn_point.y, 0.);
         let velocity = Dir2::from_rng(&mut rng) * STARTING_SPEED;
-        speeds_sq.push(velocity.norm_squared());
 
         commands.spawn((
             Particle {
@@ -285,22 +294,34 @@ fn setup(
     ));
 
     // Maxwell-Boltzmann distribution overlay
-    // Temperature comes from the equipartition theorem for a 2D monoatomic ideal gas. We know the
-    // kinetic energies, so we can reverse it to get the temperature of the system.
-    let avg_kinetic_energy =
-        PARTICLE_MASS / (2. * NUMBER_OF_PARTICLES as f32) * speeds_sq.iter().sum::<f32>();
-    let temp = avg_kinetic_energy / BOLTZMANN_CONSTANT;
-    info!("Temperature: {temp}");
-
     let sampling_points: Vec<f32> = (0..20).map(|i| i as f32 * MAX_SPEED / 20.).collect();
     let pdf_points: Vec<f32> = sampling_points
         .iter()
-        .map(|v| maxwell_boltzmann_2d_pdf(*v, PARTICLE_MASS, temp))
+        .map(|v| maxwell_boltzmann_2d_pdf(*v, PARTICLE_MASS, TEMPERATURE))
         .collect();
     let pdf_curve = CubicCardinalSpline::new(0.5, pdf_points)
         .to_curve()
         .unwrap();
     commands.insert_resource(MBDistribution(pdf_curve));
+
+    // Info text
+    // Entropy should be a compile time constant, but ops::ln() isn't a const fn
+    // This is the Sackur-Tetrode equation for a 2D monatomic ideal gas
+    let entropy = BOLTZMANN_CONSTANT
+        * NUMBER_OF_PARTICLES as f32
+        * (5. / 2. - ops::ln(PARTICLE_DENSITY * DE_BROGLIE_THERMAL_WAVELENGHT_SQUARE));
+    info!("Temperature: {TEMPERATURE}");
+    info!("Entropy: {entropy}");
+    commands.spawn((
+        Text2d::new(format!("Temperature: {TEMPERATURE:.1}")),
+        Transform::from_translation(BOX_BOTTOM_RIGHT),
+        Anchor::TopRight,
+    ));
+    commands.spawn((
+        Text2d::new(format!("Entropy: {entropy:.1}")),
+        Transform::from_translation(BOX_BOTTOM_RIGHT - Vec3::new(0., 20., 0.)),
+        Anchor::TopRight,
+    ));
 }
 
 fn update_histogram(
