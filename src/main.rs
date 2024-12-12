@@ -44,6 +44,9 @@ fn main() {
                 update_histogram.run_if(in_state(PauseState::Running)),
                 draw_distribution_overlay,
                 update_fps,
+                (update_temperature_text, update_entropy_text)
+                    .chain()
+                    .run_if(in_state(PauseState::Running)),
                 update_slow_mo_text,
             ),
         )
@@ -90,6 +93,18 @@ struct HistogramBins(Vec<f32>);
 struct MBDistribution(CubicCurve<f32>);
 
 #[derive(Component)]
+struct TemperatureText;
+
+#[derive(Resource)]
+struct Temperature(f32);
+
+#[derive(Component)]
+struct EntropyText;
+
+#[derive(Resource)]
+struct Entropy(f32);
+
+#[derive(Component)]
 struct SlowMoText;
 
 #[derive(Resource)]
@@ -109,13 +124,6 @@ const NUMBER_OF_PARTICLES: u32 = 400;
 // TODO: Calculate temperature in real time to show movement to lowest energy state. Same goes for entropy.
 const AVG_KINETIC_ENERGY: f32 = PARTICLE_MASS / 2. * STARTING_SPEED * STARTING_SPEED;
 const TEMPERATURE: f32 = AVG_KINETIC_ENERGY / BOLTZMANN_CONSTANT;
-// Order of magnitude is calculated manually to avoid floating point underflow
-// e-34 * e-34 / (e-27 * e-23) = e-68 / e-50 = e-14
-const DE_BROGLIE_THERMAL_WAVELENGHT_SQUARE: f32 =
-    2. * PI * (REDUCED_PLANCK_CONSTANT * 1e34) * (REDUCED_PLANCK_CONSTANT * 1e34)
-        / (PARTICLE_MASS * 1e27 * BOLTZMANN_CONSTANT * 1e23 * TEMPERATURE)
-        * 1e-14; // Can't use sqrt() in constant definitions
-const PARTICLE_DENSITY: f32 = NUMBER_OF_PARTICLES as f32 / BOX_AREA;
 
 // Parameters for the spawn grid
 const SPAWN_TOP_LEFT: Vec2 = Vec2::new(
@@ -344,21 +352,25 @@ fn setup(
     commands.insert_resource(MBDistribution(pdf_curve));
 
     // Info text
-    // Entropy should be a compile time constant, but ops::ln() isn't a const fn
-    // This is the Sackur-Tetrode equation for a 2D monatomic ideal gas
-    let entropy = BOLTZMANN_CONSTANT
-        * NUMBER_OF_PARTICLES as f32
-        * (5. / 2. - ops::ln(PARTICLE_DENSITY * DE_BROGLIE_THERMAL_WAVELENGHT_SQUARE));
+    let speeds: Vec<f32> = vec![STARTING_SPEED; NUMBER_OF_PARTICLES as usize];
+    let temperature = calculate_temperature(PARTICLE_MASS, NUMBER_OF_PARTICLES as f32, speeds);
     commands.spawn((
         Text2d::new(format!("Temperature: {TEMPERATURE:.1} K")),
+        TemperatureText,
         Transform::from_translation(BOX_BOTTOM_RIGHT),
         Anchor::TopRight,
     ));
+    commands.insert_resource(Temperature(temperature));
+
+    let entropy = calculate_entropy(PARTICLE_MASS, NUMBER_OF_PARTICLES as f32, temperature);
     commands.spawn((
         Text2d::new(format!("Entropy: {:.2} eV/K", entropy / ELEMENTARY_CHARGE)),
+        EntropyText,
         Transform::from_translation(BOX_BOTTOM_RIGHT - Vec3::new(0., 20., 0.)),
         Anchor::TopRight,
     ));
+    commands.insert_resource(Entropy(entropy));
+
     commands.spawn((
         Text2d::new(format!("Box dimensions: {BOX_WIDTH} m x {BOX_HEIGHT} m")),
         Transform::from_translation(BOX_BOTTOM_LEFT),
@@ -445,11 +457,9 @@ fn check_particle_collisions(mut query: Query<(&mut Particle, &mut Transform)>) 
         if circle1.intersects(&circle2) {
             let v1 = particle1.velocity;
             let v2 = particle2.velocity;
-            let m1 = particle1.mass;
-            let m2 = particle2.mass;
 
             // Calculate the change in velocity due to an elastic collision
-            let delta_v = compute_velocity_delta(x1, x2, v1, v2, m1, m2);
+            let delta_v = compute_velocity_delta(x1, x2, v1, v2);
             particle1.velocity += delta_v;
             particle2.velocity -= delta_v;
 
@@ -594,6 +604,30 @@ fn update_fps(diagnostics: Res<DiagnosticsStore>, mut query: Query<&mut Text, Wi
     }
 }
 
+fn update_temperature_text(
+    mut text_query: Query<&mut Text2d, With<TemperatureText>>,
+    particle_query: Query<&Particle>,
+    mut temperature: ResMut<Temperature>,
+) {
+    let mut text = text_query.single_mut();
+    let speeds: Vec<f32> = particle_query.iter().map(|p| p.velocity.norm()).collect();
+    let new_temp = calculate_temperature(PARTICLE_MASS, NUMBER_OF_PARTICLES as f32, speeds);
+    temperature.0 = new_temp;
+    text.0 = format!("Temperature: {:.1} K", new_temp);
+}
+
+fn update_entropy_text(
+    mut text_query: Query<&mut Text2d, With<EntropyText>>,
+    temperature: Res<Temperature>,
+    mut entropy: ResMut<Entropy>,
+) {
+    let mut text = text_query.single_mut();
+    let new_entr = calculate_entropy(PARTICLE_MASS, NUMBER_OF_PARTICLES as f32, temperature.0)
+        / ELEMENTARY_CHARGE;
+    entropy.0 = new_entr;
+    text.0 = format!("Entropy: {:.2} eV/K", new_entr);
+}
+
 fn update_slow_mo_text(mut query: Query<&mut Text2d, With<SlowMoText>>, slow_mo: Res<SlowMo>) {
     let mut text = query.single_mut();
     text.0 = format!(
@@ -603,14 +637,25 @@ fn update_slow_mo_text(mut query: Query<&mut Text2d, With<SlowMoText>>, slow_mo:
 }
 
 /* UTILITY FUNCTIONS */
-fn compute_velocity_delta(x1: Vec2, x2: Vec2, v1: Vec2, v2: Vec2, m1: f32, m2: f32) -> Vec2 {
-    let total_m = m1 + m2;
+/// Computes the velocity difference after an elastic collision of two rigid spheres of equal mass.
+fn compute_velocity_delta(x1: Vec2, x2: Vec2, v1: Vec2, v2: Vec2) -> Vec2 {
     let delta_v = v1 - v2;
     let delta_x = x1 - x2;
 
-    return -2.0 * m2 / total_m * delta_v.dot(delta_x) / delta_x.norm_squared() * delta_x;
+    return -delta_v.dot(delta_x) / delta_x.norm_squared() * delta_x;
 }
 
+/// Computes the velocity difference after an elastic collision of two rigid spheres of different mass.
+// fn compute_velocity_delta_masses(x1: Vec2, x2: Vec2, v1: Vec2, v2: Vec2, m1: f32, m2: f32) -> Vec2 {
+//     let total_m = m1 + m2;
+//     let delta_v = v1 - v2;
+//     let delta_x = x1 - x2;
+
+//     return -2.0 * m2 / total_m * delta_v.dot(delta_x) / delta_x.norm_squared() * delta_x;
+// }
+
+/// Compute the vector that describes the overlap between two intersecting spheres.
+/// The direction of the vector is `x2` towards `x1`.
 fn compute_particle_overlap(x1: Vec2, x2: Vec2, radius1: f32, radius2: f32) -> Vec3 {
     let distance_between_centers = x1 - x2;
     let distance = distance_between_centers.norm().max(0.);
@@ -619,6 +664,8 @@ fn compute_particle_overlap(x1: Vec2, x2: Vec2, radius1: f32, radius2: f32) -> V
     return Vec3::new(overlap_vec.x, overlap_vec.y, 0.);
 }
 
+/// Compute the vector that describes the overlap between a sphere intersecting an axis-aligned rectangle.
+/// Direction of the vector is towards the wall.
 fn compute_wall_overlap(
     part_center: Vec2,
     wall_center: Vec2,
@@ -657,4 +704,26 @@ fn maxwell_boltzmann_2d_pdf(speed: f32, mass: f32, temperature: f32) -> f32 {
     let a_sq = BOLTZMANN_CONSTANT * temperature / mass;
     let speed_sq = speed.powi(2);
     return speed / a_sq * (-speed_sq / (2. * a_sq)).exp();
+}
+
+/// Calculate the system temperature from the particle velocities. Assumes free particles.
+fn calculate_temperature(particle_mass: f32, number_of_particles: f32, speeds: Vec<f32>) -> f32 {
+    let avg_kinetic_energy =
+        particle_mass / 2. * speeds.iter().map(|v| v * v).sum::<f32>() / number_of_particles;
+    return avg_kinetic_energy / BOLTZMANN_CONSTANT;
+}
+
+/// Calculate the system entropy from the temperature using the Sackur-Tetrode equation for a 2D monatomic ideal gas.
+fn calculate_entropy(particle_mass: f32, number_of_particles: f32, temperature: f32) -> f32 {
+    // Order of magnitude is calculated manually to avoid floating point underflow
+    // e-34 * e-34 / (e-27 * e-23) = e-68 / e-50 = e-14
+    let de_broglie_thermal_wavelength_square =
+        2. * PI * (REDUCED_PLANCK_CONSTANT * 1e34) * (REDUCED_PLANCK_CONSTANT * 1e34)
+            / (particle_mass * 1e27 * BOLTZMANN_CONSTANT * 1e23 * temperature)
+            * 1e-14;
+    let particle_density = number_of_particles / BOX_AREA;
+
+    return BOLTZMANN_CONSTANT
+        * number_of_particles
+        * (5. / 2. - ops::ln(particle_density * de_broglie_thermal_wavelength_square));
 }
